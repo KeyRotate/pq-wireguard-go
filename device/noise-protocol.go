@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	kyberk2so "github.com/symbolicsoft/kyber-k2so"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
@@ -60,8 +61,8 @@ const (
 )
 
 const (
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageResponseSize        = 92                                            // size of response message
+	MessageInitiationSize      = 148 + kyberk2so.Kyber768PKBytes               // size of handshake initiation message
+	MessageResponseSize        = 92 + kyberk2so.Kyber768CTBytes                // size of response message
 	MessageCookieReplySize     = 64                                            // size of cookie reply message
 	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
 	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
@@ -82,23 +83,25 @@ const (
  */
 
 type MessageInitiation struct {
-	Type      uint32
-	Sender    uint32
-	Ephemeral NoisePublicKey
-	Static    [NoisePublicKeySize + poly1305.TagSize]byte
-	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Type           uint32
+	Sender         uint32
+	Ephemeral      NoisePublicKey
+	KyberEphemeral Kyber768PublicKey
+	Static         [NoisePublicKeySize + poly1305.TagSize]byte
+	Timestamp      [tai64n.TimestampSize + poly1305.TagSize]byte
+	MAC1           [blake2s.Size128]byte
+	MAC2           [blake2s.Size128]byte
 }
 
 type MessageResponse struct {
-	Type      uint32
-	Sender    uint32
-	Receiver  uint32
-	Ephemeral NoisePublicKey
-	Empty     [poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Type       uint32
+	Sender     uint32
+	Receiver   uint32
+	Ephemeral  NoisePublicKey
+	CipherText Kyber768CipherText
+	Empty      [poly1305.TagSize]byte
+	MAC1       [blake2s.Size128]byte
+	MAC2       [blake2s.Size128]byte
 }
 
 type MessageTransport struct {
@@ -116,20 +119,22 @@ type MessageCookieReply struct {
 }
 
 type Handshake struct {
-	state                     handshakeState
-	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte       // hash value
-	chainKey                  [blake2s.Size]byte       // chain key
-	presharedKey              NoisePresharedKey        // psk
-	localEphemeral            NoisePrivateKey          // ephemeral secret key
-	localIndex                uint32                   // used to clear hash-table
-	remoteIndex               uint32                   // index for sending
-	remoteStatic              NoisePublicKey           // long term key
-	remoteEphemeral           NoisePublicKey           // ephemeral public key
-	precomputedStaticStatic   [NoisePublicKeySize]byte // precomputed shared secret
-	lastTimestamp             tai64n.Timestamp
-	lastInitiationConsumption time.Time
-	lastSentHandshake         time.Time
+	state                      handshakeState
+	mutex                      sync.RWMutex
+	hash                       [blake2s.Size]byte       // hash value
+	chainKey                   [blake2s.Size]byte       // chain key
+	presharedKey               NoisePresharedKey        // psk
+	localEphemeral             NoisePrivateKey          // ephemeral secret key
+	localIndex                 uint32                   // used to clear hash-table
+	remoteIndex                uint32                   // index for sending
+	remoteStatic               NoisePublicKey           // long term key
+	remoteEphemeral            NoisePublicKey           // ephemeral public key
+	precomputedStaticStatic    [NoisePublicKeySize]byte // precomputed shared secret
+	lastTimestamp              tai64n.Timestamp
+	lastInitiationConsumption  time.Time
+	lastSentHandshake          time.Time
+	kyberLocalPrivateEphemeral Kyber768PrivateKey // kyber ephemeral private key
+	kyberRemotePublicEphemeral Kyber768PublicKey  // kyber ephemeral public key
 }
 
 var (
@@ -153,6 +158,8 @@ func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
 func (h *Handshake) Clear() {
 	setZero(h.localEphemeral[:])
 	setZero(h.remoteEphemeral[:])
+	setZero(h.kyberLocalPrivateEphemeral[:])
+	setZero(h.kyberRemotePublicEphemeral[:])
 	setZero(h.chainKey[:])
 	setZero(h.hash[:])
 	h.localIndex = 0
@@ -191,15 +198,24 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		return nil, err
 	}
 
+	kyberPrivateKey, kyberPublicKey, err := kyberk2so.KemKeypair768()
+	if err != nil {
+		return nil, err
+	}
+	handshake.kyberLocalPrivateEphemeral = kyberPrivateKey
+
 	handshake.mixHash(handshake.remoteStatic[:])
 
 	msg := MessageInitiation{
-		Type:      MessageInitiationType,
-		Ephemeral: handshake.localEphemeral.publicKey(),
+		Type:           MessageInitiationType,
+		Ephemeral:      handshake.localEphemeral.publicKey(),
+		KyberEphemeral: kyberPublicKey,
 	}
 
 	handshake.mixKey(msg.Ephemeral[:])
 	handshake.mixHash(msg.Ephemeral[:])
+	handshake.mixHash(msg.KyberEphemeral[:])
+	// handshake.mixKey(msg.KyberEphemeral[:])
 
 	// encrypt static key
 	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
@@ -260,6 +276,8 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
 	mixHash(&hash, &hash, msg.Ephemeral[:])
 	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
+	mixHash(&hash, &hash, msg.KyberEphemeral[:])
+	// mixKey(&chainKey, &InitialChainKey, msg.KyberEphemeral[:])
 
 	// decrypt static key
 	var peerPK NoisePublicKey
@@ -331,6 +349,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.chainKey = chainKey
 	handshake.remoteIndex = msg.Sender
 	handshake.remoteEphemeral = msg.Ephemeral
+	handshake.kyberRemotePublicEphemeral = msg.KyberEphemeral
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
 	}
@@ -381,6 +400,13 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	handshake.mixHash(msg.Ephemeral[:])
 	handshake.mixKey(msg.Ephemeral[:])
 
+	ct, kyberssB, err := kyberk2so.KemEncrypt768(handshake.kyberRemotePublicEphemeral)
+	if err != nil {
+		return nil, err
+	}
+
+	msg.CipherText = ct
+
 	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteEphemeral)
 	if err != nil {
 		return nil, err
@@ -391,6 +417,10 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 		return nil, err
 	}
 	handshake.mixKey(ss[:])
+
+	handshake.mixKey(ct[:])
+	handshake.mixKey(kyberssB[:])
+	handshake.mixHash(ct[:])
 
 	// add preshared key
 
@@ -449,6 +479,12 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		device.staticIdentity.RLock()
 		defer device.staticIdentity.RUnlock()
 
+		var err error
+		kyberssA, err := kyberk2so.KemDecrypt768(msg.CipherText, handshake.kyberLocalPrivateEphemeral)
+		if err != nil {
+			return false
+		}
+
 		// finish 3-way DH
 
 		mixHash(&hash, &handshake.hash, msg.Ephemeral[:])
@@ -467,6 +503,10 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		}
 		mixKey(&chainKey, &chainKey, ss[:])
 		setZero(ss[:])
+
+		mixKey(&chainKey, &chainKey, msg.CipherText[:])
+		mixKey(&chainKey, &chainKey, kyberssA[:])
+		mixHash(&hash, &hash, msg.CipherText[:])
 
 		// add preshared key (psk)
 
@@ -553,6 +593,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 	setZero(handshake.chainKey[:])
 	setZero(handshake.hash[:]) // Doesn't necessarily need to be zeroed. Could be used for something interesting down the line.
 	setZero(handshake.localEphemeral[:])
+	setZero(handshake.kyberLocalPrivateEphemeral[:])
 	peer.handshake.state = handshakeZeroed
 
 	// create AEAD instances
