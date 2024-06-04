@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	kyberk2so "github.com/symbolicsoft/kyber-k2so"
 )
 
 const (
@@ -21,6 +22,9 @@ type (
 	NoisePublicKey    [NoisePublicKeySize]byte
 	NoisePrivateKey   [NoisePrivateKeySize]byte
 	NoisePresharedKey [NoisePresharedKeySize]byte
+	Kyber768PublicKey    [kyberk2so.Kyber768PKBytes]byte
+	Kyber768PrivateKey    [kyberk2so.Kyber768SKBytes]byte
+	Kyber768CipherText    [kyberk2so.Kyber768CTBytes]byte
 	NoiseNonce        uint64 // padded to 12-bytes
 )
 
